@@ -1,0 +1,10 @@
+from binary_simple_model import SimpleSurfacePredictor
+from binary_plis_model import PlisSimpleSurfacePredictor
+from dice_model import DiceSurfacePredictor
+from sparse_dice_model import DiceSparseSurfacePredictor
+
+
+#model_class = SimpleSurfacePredictor
+#model_class = PlisSimpleSurfacePredictor
+#model_class = DiceSurfacePredictor
+model_class = DiceSparseSurfacePredictor
