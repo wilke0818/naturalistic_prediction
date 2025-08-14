@@ -7,6 +7,18 @@ import torch.optim as optim
 import random
 
 # ---- Simple Model ----
+
+class ResidualBlock(nn.Module):
+    """Residual block"""
+
+    def __init__(self, block):
+        super().__init__()
+        self.block = block
+
+    def forward(self, x: torch.Tensor):
+        return self.block(x) + x
+
+
 class PlisSimpleSurfacePredictor(nn.Module):
 
     MODEL_NAME = "simple_plis_model"
@@ -18,28 +30,30 @@ class PlisSimpleSurfacePredictor(nn.Module):
     Returns:
         (B, surface_dim) prediction per trial.
     """
-    def __init__(self, aggregation_method='mean', input_projection_size=128,embedding_dim=32, num_heads=2, transformer_layers=2,
-                  dropout_rate=.2, surface_dim=1056, num_stimuli=10, **kwargs):
+    def __init__(self, input_projection_size=128,
+                  dropout_rate=.2, surface_dim=1056,  output_dim=None, num_layers=0,**kwargs):
         super().__init__()
-        self.aggregation_method = aggregation_method
         self.input_projection_size = input_projection_size
-        self.embedding_dim = embedding_dim
-        self.num_heads = num_heads
-        self.transformer_layers = transformer_layers
+        #self.embedding_dim = embedding_dim
+        #self.num_heads = num_heads
+        #self.transformer_layers = transformer_layers
         self.dropout_rate = dropout_rate
         #self.fc_output_size = fc_output_size
         self.surface_dim = surface_dim
-        self.num_stimuli = num_stimuli
+        self.output_dim = output_dim if output_dim else surface_dim
+        self.num_layers = num_layers
+        #self.num_stimuli = num_stimuli
 
         self.config = {
-            'aggregation_method': aggregation_method,
             'input_projection_size': input_projection_size,
-            'embedding_dim': embedding_dim,
-            'num_heads': num_heads,
-            'transformer_layers': transformer_layers,
+            #'embedding_dim': embedding_dim,
+            #'num_heads': num_heads,
+            #'transformer_layers': transformer_layers,
             'dropout_rate': dropout_rate,
             'surface_dim': surface_dim,
-            'num_stimuli': num_stimuli
+            'output_dim': output_dim,
+            'num_layers': num_layers
+            #'num_stimuli': num_stimuli
         }
 
         # Simple linear projection per time step
@@ -53,15 +67,45 @@ class PlisSimpleSurfacePredictor(nn.Module):
         #self.stim_emb = nn.Embedding(num_stimuli, embedding_dim)
 
         # Final prediction head
+
+        layers = [
+            nn.Linear(surface_dim, input_projection_size),
+            nn.LayerNorm(input_projection_size),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+        ]
+
+        for _ in range(num_layers):
+            layers.append(
+                nn.Sequential(
+                    ResidualBlock(
+                        nn.Sequential(
+                            nn.Linear(input_projection_size, input_projection_size),
+                            nn.LayerNorm(input_projection_size),
+                        )
+                    ),
+                    nn.ReLU(),
+                    nn.Dropout(p=dropout_rate),
+                ),
+            )
+
+        # output block
+        layers.append(
+            nn.Linear(input_projection_size, self.output_dim),
+        )
+
+        self.fc = nn.Sequential(*layers)
+
+        """
         self.fc = nn.Sequential(
             nn.Linear(surface_dim, input_projection_size),
             nn.LayerNorm(input_projection_size),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(input_projection_size, surface_dim)
+            nn.Linear(input_projection_size, self.output_dim)
         )
         self.sigmoid = nn.Sigmoid()
-
+        """
         
 
     @staticmethod
@@ -72,29 +116,21 @@ class PlisSimpleSurfacePredictor(nn.Module):
     @staticmethod
     def _found_hyperparams(study):
         return {
-            'aggregation_method': study.best_trial.params['aggregation_method'],
             'lr': study.best_trial.params['lr_exp'],
-            'embedding_dim': study.best_trial.params['embedding_dim'],
-            'num_heads': study.best_trial.params['num_heads'],
-            'transformer_layers': study.best_trial.params['transformer_layers'],
             'weight_decay': study.best_trial.params['weight_decay'],
             'input_projection_size': study.best_trial.params['input_projection_size'],
             'dropout_rate': study.best_trial.params['dropout_rate'],
-            'fc_output_size': study.best_trial.params['input_projection_size'],
+            'num_layers': study.best_trial.params['num_layers'],
         }
 
     @staticmethod
     def _sample_optuna_hyperparams(trial):
         return {
-                'aggregation_method': trial.suggest_categorical('aggregation_method', ['mean']),
-                'lr': trial.suggest_float('lr_exp', 10**(-5), 10**(-3)),
-                'embedding_dim': trial.suggest_categorical('embedding_dim', [64]),
-                'num_heads': trial.suggest_categorical('num_heads', [8]),
-                'transformer_layers': trial.suggest_categorical('transformer_layers', [6]),
-                'weight_decay': trial.suggest_categorical('weight_decay', [0.0, 1e-5, 1e-4]),
-                'input_projection_size': trial.suggest_categorical('input_projection_size', [128,256,512]),
-                'dropout_rate': trial.suggest_float('dropout_rate', .01, .25),
-                'fc_output_size': trial.suggest_categorical('fc_output_size', [128]),
+                'lr': trial.suggest_float('lr_exp', 10**(-5),10**(-2),log=True),
+                'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-2,log=True),
+                'input_projection_size': trial.suggest_int('input_projection_size', 32,512),
+                'dropout_rate': trial.suggest_float('dropout_rate', .01, .9),
+                'num_layers': trial.suggest_int('num_layers',0,4),
             }
 
     @staticmethod
@@ -111,9 +147,30 @@ class PlisSimpleSurfacePredictor(nn.Module):
             'fc_output_size': random.choice([256,512,1024])
         }
 
+    def forward(self, x: torch.Tensor, stimuli: torch.Tensor, lengths=None, introspection=False,output_temporal_attention=False,output_spatial_attention=False):
+        bs, tl, fs = x.shape  # [batch_size, time_length, input_feature_size]
 
+        fc_output = self.fc(x.view(-1, fs))
+        fc_output = fc_output.view(bs, tl, -1)
+
+        logits = fc_output.mean(1)
+
+        if introspection:
+            predictions = torch.argmax(logits, axis=-1)
+            return fc_output, predictions
+
+        if output_temporal_attention and output_spatial_attention:
+            return logits, None, None
+        elif output_temporal_attention and not output_spatial_attention:
+            return logits, None
+        elif not output_temporal_attention and output_spatial_attention:
+            return logits, None
+        else:
+            return logits
+
+    """
     def forward(self, fmri, stimulus, lengths):
-        """fmri: (B, T, D_pad)  | lengths: (B,) actual lengths"""
+        #fmri: (B, T, D_pad)  | lengths: (B,) actual lengths
         x = self.fc(fmri)  # (B, T, E)
 
         # Create mask where True = padded element
@@ -132,3 +189,4 @@ class PlisSimpleSurfacePredictor(nn.Module):
         #stim_vec = self.stim_emb(stimulus)
         #x = torch.cat([x, stim_vec], dim=1)
 #        return self.sigmoid(x)
+    """
